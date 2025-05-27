@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>AI Dodgeball Arena</title>
+  <style>
+    body { margin: 0; overflow: hidden; }
+    canvas { display: block; }
+    #ui {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      z-index: 1;
+      color: white;
+    }
+    button {
+      padding: 10px 15px;
+      margin-right: 10px;
+    }
+  </style>
+</head>
+<body>
+<div id="ui">
+  <button onclick="startGame()">Start Game</button>
+  <p>Press <strong>Tab</strong> to start the game, <strong>Backspace</strong> to reset learning.<br>
+     Left click inside a court side to add a bot to that team.</p>
+  <div>Left Score: <span id="leftScore">0</span> | Right Score: <span id="rightScore">0</span></div>
+</div>
+<div id="gameOverMessage" style="display:none; position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); font-size: 32px; color: red; font-weight: bold;">Game Over</div>
+<script type="module">
+  import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.152.2/build/three.module.js';
+  import { OrbitControls } from 'https://cdn.jsdelivr.net/npm/three@0.152.2/examples/jsm/controls/OrbitControls.js';
+
+  let scene, camera, renderer, cubes = [], ball, gameStarted = false, whiteLine, teamCount = 2;
+  let aiMemory = JSON.parse(localStorage.getItem('aiMemory')) || {};
+  let scores = { left: 0, right: 0 };
+
+  const faceTexture = new THREE.TextureLoader().load('https://i.imgur.com/0Z8FvBt.png');
+
+  init();
+  animate();
+
+  function init() {
+    scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x202020);
+
+    camera = new THREE.PerspectiveCamera(75, window.innerWidth/window.innerHeight, 0.1, 1000);
+    camera.position.set(0, 10, 20);
+
+    renderer = new THREE.WebGLRenderer();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+
+    const light = new THREE.HemisphereLight(0xffffff, 0x444444);
+    light.position.set(0, 20, 0);
+    scene.add(light);
+
+    const ground = new THREE.Mesh(
+      new THREE.PlaneGeometry(30, 30),
+      new THREE.MeshStandardMaterial({ color: 0x444444 })
+    );
+    ground.rotation.x = -Math.PI / 2;
+    scene.add(ground);
+
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'Tab') {
+        e.preventDefault();
+        startGame();
+      } else if (e.key === 'Backspace') {
+        e.preventDefault();
+        resetLearning();
+      } else if (e.code === 'ControlLeft') {
+        drawWhiteLine();
+      } else if (e.code === 'AltLeft') {
+        teamCount = teamCount < 4 ? teamCount + 1 : 2;
+        console.log(`Team count set to ${teamCount}`);
+      }
+    });
+
+    renderer.domElement.addEventListener('click', (event) => {
+      const mouse = new THREE.Vector2(
+        (event.clientX / window.innerWidth) * 2 - 1,
+        -(event.clientY / window.innerHeight) * 2 + 1
+      );
+      const raycaster = new THREE.Raycaster();
+      raycaster.setFromCamera(mouse, camera);
+      const intersects = raycaster.intersectObjects([ground]);
+      if (intersects.length > 0) {
+        const point = intersects[0].point;
+        const team = point.x < 0 ? 'left' : 'right';
+        spawnAICube(team, point);
+      }
+    });
+
+    updateScoreDisplay();
+  }
+
+  function drawWhiteLine() {
+    if (whiteLine) scene.remove(whiteLine);
+    const lineMaterial = new THREE.LineBasicMaterial({ color: 0xffffff });
+    const points = [new THREE.Vector3(-15, 0.01, 0), new THREE.Vector3(15, 0.01, 0)];
+    const geometry = new THREE.BufferGeometry().setFromPoints(points);
+    whiteLine = new THREE.Line(geometry, lineMaterial);
+    scene.add(whiteLine);
+  }
+
+  function spawnAICube(side, position = null) {
+    const faceMaterial = new THREE.MeshStandardMaterial({ map: faceTexture });
+    const teamColors = [0x00ff00, 0xff0000, 0x0000ff, 0xffff00];
+    const color = teamColors[cubes.length % teamCount];
+    const colorMaterial = new THREE.MeshStandardMaterial({ color });
+    const materials = [colorMaterial, colorMaterial, colorMaterial, colorMaterial, faceMaterial, colorMaterial];
+    const geometry = new THREE.BoxGeometry(1, 1, 1);
+    const cube = new THREE.Mesh(geometry, materials);
+
+    if (position) {
+      cube.position.copy(position);
+      cube.position.y = 0.5;
+    } else {
+      cube.position.x = side === 'left' ? -5 : 5;
+      cube.position.z = (Math.random() - 0.5) * 10;
+      cube.position.y = 0.5;
+    }
+
+    const id = `ai_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+    if (!aiMemory[id]) aiMemory[id] = 0;
+
+    scene.add(cube);
+    cubes.push({ mesh: cube, side, alive: true, jumpCooldown: 0, id });
+  }
+
+  function startGame() {
+    if (cubes.filter(c => c.alive && !c.isFragment).length < 2) return;
+    gameStarted = true;
+    if (!ball) {
+      const geometry = new THREE.SphereGeometry(0.5, 32, 32);
+      const material = new THREE.MeshStandardMaterial({ color: 0xffff00 });
+      ball = new THREE.Mesh(geometry, material);
+      ball.position.set(0, 0.5, 0);
+      ball.velocity = new THREE.Vector3(0.15, 0, 0);
+      scene.add(ball);
+    }
+  }
+
+  function shatterCube(cubeObj) {
+    scene.remove(cubeObj.mesh);
+    cubeObj.alive = false;
+
+    for (let i = 0; i < 10; i++) {
+      const frag = new THREE.Mesh(
+        new THREE.BoxGeometry(0.2, 0.2, 0.2),
+        new THREE.MeshStandardMaterial({ color: 0xffffff })
+      );
+      frag.position.copy(cubeObj.mesh.position);
+      frag.velocity = new THREE.Vector3(
+        (Math.random() - 0.5) * 2,
+        Math.random() * 2,
+        (Math.random() - 0.5) * 2
+      );
+      frag.life = 100;
+      scene.add(frag);
+      cubes.push({ mesh: frag, isFragment: true });
+    }
+
+    setTimeout(() => {
+      const winner = cubeObj.side === 'left' ? 'right' : 'left';
+      updateLearning(cubeObj.id);
+      scores[winner]++;
+      updateScoreDisplay();
+      resetGame();
+    }, 2000);
+  }
+
+  function updateLearning(id) {
+    aiMemory[id] += 1;
+    localStorage.setItem('aiMemory', JSON.stringify(aiMemory));
+    console.log(`${id} learned. Level: ${aiMemory[id]}`);
+  }
+
+  function resetLearning() {
+    aiMemory = {};
+    localStorage.removeItem('aiMemory');
+    console.log("AI memory reset");
+  }
+
+  function updateScoreDisplay() {
+    document.getElementById('leftScore').textContent = scores.left;
+    document.getElementById('rightScore').textContent = scores.right;
+  }
+
+  function resetGame() {
+    document.getElementById('gameOverMessage').style.display = 'block';
+    setTimeout(() => {
+      cubes.forEach(obj => scene.remove(obj.mesh));
+      cubes = [];
+      if (ball) {
+        scene.remove(ball);
+        ball = null;
+      }
+      gameStarted = false;
+      document.getElementById('gameOverMessage').style.display = 'none';
+    }, 3000);
+  }
+
+  function animate() {
+    requestAnimationFrame(animate);
+
+    if (gameStarted && ball) {
+      ball.position.add(ball.velocity);
+
+      cubes.forEach(cubeObj => {
+        if (!cubeObj.alive || cubeObj.isFragment) return;
+
+        const level = aiMemory[cubeObj.id] || 0;
+        const speed = 0.05 + level * 0.01;
+        cubeObj.mesh.position.z += speed * (cubeObj.side === 'left' ? 1 : -1);
+
+        const dodgeChance = 0.2 + level * 0.05;
+        if (Math.random() < dodgeChance) {
+          cubeObj.mesh.position.z += (Math.random() - 0.5) * 0.5;
+          if (cubeObj.jumpCooldown <= 0 && Math.random() < 0.3) {
+            cubeObj.mesh.position.y += 1.5;
+            cubeObj.jumpCooldown = 30;
+          }
+        }
+
+        if (cubeObj.jumpCooldown > 0) cubeObj.jumpCooldown--;
+        if (cubeObj.mesh.position.y > 0.5) cubeObj.mesh.position.y -= 0.1;
+
+        if (whiteLine && Math.abs(cubeObj.mesh.position.z) > 15) {
+          shatterCube(cubeObj);
+        }
+
+        const dist = cubeObj.mesh.position.distanceTo(ball.position);
+        if (dist < 1 && cubeObj.alive) {
+          const catchChance = 0.3 + level * 0.05;
+          if (Math.random() < catchChance) {
+            const opponent = cubes.find(c => c.side !== cubeObj.side && c.alive);
+            if (opponent) shatterCube(opponent);
+          } else {
+            shatterCube(cubeObj);
+          }
+        }
+      });
+
+      cubes.forEach(obj => {
+        if (obj.isFragment) {
+          obj.mesh.position.add(obj.velocity);
+          obj.velocity.y -= 0.05;
+          if (--obj.life < 0) scene.remove(obj.mesh);
+        }
+      });
+    }
+
+    renderer.render(scene, camera);
+  }
+</script>
+</body>
+</html>
